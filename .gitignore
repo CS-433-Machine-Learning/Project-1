@@ -2,3 +2,7 @@ data/
 grading_tests/
 latex-example-paper/
 project1_description.pdf
+sample_submission.csv
+x_test.csv
+x_train.csv
+y_train.csv

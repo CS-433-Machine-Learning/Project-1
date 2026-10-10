@@ -58,25 +58,27 @@ def batch_iter(y, tx, batch_size, num_batches=1, shuffle=True):
             start_index + batch_size
         )  # The first data point of the following batch
         
-def compute_gradient(y, tx, w, mae=False):
+def linear_gradient(y, tx, w, mae=False):
     """Computes the gradient at w for MAE or MSE
 
     Args:
-        y: shape=(N, )
-        tx: shape=(N,2)
-        w: shape=(2, ). The vector of model parameters.
+        y:  shape=(N, )
+        tx: shape=(N,D)
+        w:  shape=(D, ). The vector of model parameters.
         MAE: bool. Whether MAE should be used instead of MSE.
 
     Returns:
         An array of shape (2, ) (same shape as w), containing the gradient of the loss at w.
     """
+    assert y.shape[0] == tx.shape[0]
+    assert tx.shape[1] == w.shape[0]
     e = y - np.matmul(tx, w)
     if mae:
         return -1 / y.shape[0] * np.matmul(np.transpose(tx), np.sign(e))
     else:
         return - 1 / y.shape[0] * np.matmul(np.transpose(tx), e)
 
-def compute_loss(y, tx, w, MAE = False):
+def linear_loss(y, tx, w, MAE = False):
     """Calculate the loss using either MSE or MAE.
 
     Args:
@@ -88,9 +90,11 @@ def compute_loss(y, tx, w, MAE = False):
     Returns:
         the value of the loss (a scalar), corresponding to the input parameters w.
     """
+    assert y.shape[0] == tx.shape[0]
     N = y.shape[0]
     e = y - np.matmul(tx, w)
     if MAE:
         return 1 / N * np.sum(e)
     else:
         return 1 / N * np.matmul(np.transpose(e), e)
+    

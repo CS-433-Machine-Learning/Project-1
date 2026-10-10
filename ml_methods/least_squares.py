@@ -1,5 +1,5 @@
 import numpy as np
-from ml_methods_helpers import compute_loss
+from ml_methods.linear_helpers import linear_loss
 
 def least_squares(y,tx):
     """Calculate the least squares solution.
@@ -18,5 +18,5 @@ def least_squares(y,tx):
     """
     
     w = np.linalg.solve(np.matmul(np.transpose(tx), tx), np.matmul(np.transpose(tx), y))
-    mse = compute_loss(y, tx, w, mae=False)
+    mse = linear_loss(y, tx, w, mae=False)
     return [w, mse]

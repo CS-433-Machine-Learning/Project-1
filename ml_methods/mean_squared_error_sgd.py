@@ -1,4 +1,4 @@
-from ml_methods_helpers import batch_iter, linear_loss, linear_gradient
+from ml_methods.linear_helpers import batch_iter, linear_loss, linear_gradient
 
 def mean_squared_error_sgd(y, tx, initial_w, max_iters, gamma, batch_size=1, mae=False):
     """The Stochastic Gradient Descent algorithm (SGD).

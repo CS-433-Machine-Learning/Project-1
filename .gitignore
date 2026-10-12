@@ -6,3 +6,5 @@ sample_submission.csv
 x_test.csv
 x_train.csv
 y_train.csv
+# Python cache
+__pycache__/

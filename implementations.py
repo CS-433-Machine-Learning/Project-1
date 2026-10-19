@@ -110,7 +110,7 @@ def logistic_loss(y, tx, w):
     return np.mean(np.logaddexp(0, z) - y * z)
 
 
-def logistic_gradient(y, tx, w, lambda_=0):
+def logistic_gradient(y, tx, w, lambda_=0, weights=None):
     """Compute the gradient of the (regularized) logistic loss.
 
     The penalty is lambda_ * ||w||^2, hence the 2 * lambda_ * w term.
@@ -120,14 +120,18 @@ def logistic_gradient(y, tx, w, lambda_=0):
         tx: shape=(N, D)
         w:  shape=(D, )
         lambda_: scalar, regularization parameter
+        weights: shape=(N, ), optional per-sample weights of the loss
 
     Returns:
         a vector of shape (D, )
     """
-    return tx.T @ (sigmoid(tx @ w) - y) / len(y) + 2 * lambda_ * w
+    residual = sigmoid(tx @ w) - y
+    if weights is not None:
+        residual = weights * residual
+    return tx.T @ residual / len(y) + 2 * lambda_ * w
 
 
-def logistic_hessian(tx, w, lambda_=0):
+def logistic_hessian(tx, w, lambda_=0, weights=None):
     """Compute the Hessian of the (regularized) logistic loss.
 
     Uses tx.T @ diag(s) @ tx = (tx.T * s) @ tx, so the N x N diagonal matrix is never built.
@@ -136,12 +140,15 @@ def logistic_hessian(tx, w, lambda_=0):
         tx: shape=(N, D)
         w:  shape=(D, )
         lambda_: scalar, regularization parameter
+        weights: shape=(N, ), optional per-sample weights of the loss
 
     Returns:
         a hessian matrix of shape=(D, D)
     """
     pred = sigmoid(tx @ w)
     s = pred * (1 - pred)
+    if weights is not None:
+        s = weights * s
     return (tx.T * s) @ tx / tx.shape[0] + 2 * lambda_ * np.identity(tx.shape[1])
 
 
@@ -266,11 +273,13 @@ def reg_logistic_regression(y, tx, lambda_, initial_w, max_iters, gamma):
 
 
 # ---------------------------------------------------------------------------
-# Extra (not graded): Newton's method, for the competition part
+# Extra (not graded): Newton's method and a linear SVM, for the competition part
 # ---------------------------------------------------------------------------
 
 
-def reg_logistic_regression_newton(y, tx, lambda_, initial_w, max_iters, gamma=1.0):
+def reg_logistic_regression_newton(
+    y, tx, lambda_, initial_w, max_iters, gamma=1.0, weights=None
+):
     """Regularized logistic regression using Newton's method (labels in {0, 1}).
 
     Each step costs O(N D^2 + D^3), but needs far fewer iterations than GD.
@@ -282,14 +291,67 @@ def reg_logistic_regression_newton(y, tx, lambda_, initial_w, max_iters, gamma=1
         initial_w: shape=(D, ). The initial guess for the model parameters
         max_iters: a scalar denoting the total number of Newton steps
         gamma: a scalar denoting the stepsize (1.0 is the pure Newton step)
+        weights: shape=(N, ), optional per-sample weights (e.g. to balance classes)
 
     Returns:
         w: the last weight vector of the method, shape=(D, )
-        loss: the corresponding logistic loss, without the penalty term (scalar)
+        loss: the corresponding (unweighted) logistic loss, without the penalty term
     """
     w = initial_w
     for _ in range(max_iters):
-        gradient = logistic_gradient(y, tx, w, lambda_)
-        hessian = logistic_hessian(tx, w, lambda_)
+        gradient = logistic_gradient(y, tx, w, lambda_, weights)
+        hessian = logistic_hessian(tx, w, lambda_, weights)
         w = w - gamma * np.linalg.solve(hessian, gradient)
     return w, logistic_loss(y, tx, w)
+
+
+def hinge_loss(y, tx, w):
+    """Average hinge loss max(0, 1 - y x^T w), without regularization term.
+
+    Args:
+        y:  shape=(N, ), labels in {-1, 1}
+        tx: shape=(N, D)
+        w:  shape=(D, )
+
+    Returns:
+        a non-negative loss (numpy scalar)
+    """
+    return np.mean(np.maximum(0, 1 - y * (tx @ w)))
+
+
+def svm_subgradient_descent(
+    y, tx, lambda_, initial_w, max_iters, gamma, balanced=False
+):
+    """Soft-margin linear SVM by subgradient descent (labels in {-1, 1}).
+
+    Minimizes lambda_/2 ||w||^2 + 1/N sum_n c_n max(0, 1 - y_n x_n^T w). The hinge
+    loss is not differentiable at the margin, so we use a subgradient and the
+    decreasing step size gamma / sqrt(t + 1).
+
+    With unbalanced classes, always predicting the majority class already gives a
+    low hinge loss. balanced=True weights the samples (c_n) so that each class
+    counts for half of the loss; otherwise c_n = 1.
+
+    Args:
+        y: shape=(N, ), labels in {-1, 1}
+        tx: shape=(N, D)
+        lambda_: scalar, regularization parameter
+        initial_w: shape=(D, ). The initial guess for the model parameters
+        max_iters: a scalar denoting the total number of iterations
+        gamma: a scalar denoting the initial stepsize
+        balanced: whether to reweight the two classes equally
+
+    Returns:
+        w: the last weight vector of the method, shape=(D, )
+        loss: the corresponding (unweighted) hinge loss, without the penalty term
+    """
+    weights = np.ones(len(y))
+    if balanced:
+        pos = np.mean(y == 1)
+        weights = np.where(y == 1, 0.5 / pos, 0.5 / (1 - pos))
+    w = initial_w
+    for t in range(max_iters):
+        active = y * (tx @ w) < 1  # points inside the margin
+        subgradient = -tx.T @ (active * weights * y) / len(y) + lambda_ * w
+        w = w - gamma / np.sqrt(t + 1) * subgradient
+    return w, hinge_loss(y, tx, w)

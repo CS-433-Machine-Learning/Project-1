@@ -1,27 +1,34 @@
 """Generate the AIcrowd submission for Project 1 (heart disease prediction).
 
-Pipeline: load data -> clean features -> standardize -> regularized logistic
-regression -> pick the decision threshold on a validation split -> predict test set.
+Pipeline: load data -> clean features -> standardize -> add squared and interaction
+features -> regularized logistic regression (Newton's method) -> pick the decision
+threshold by 5-fold cross-validation -> predict test set.
 
 Usage: python run.py  (expects the dataset in data/dataset/, writes submission.csv)
 """
 
+import itertools
 import os
 
 import numpy as np
 
 from helpers import create_csv_submission, load_csv_data
-from implementations import reg_logistic_regression, sigmoid
+from implementations import (
+    reg_logistic_regression,
+    reg_logistic_regression_newton,
+    sigmoid,
+)
 
 DATA_DIR = "data/dataset"
 CACHE_FILE = "data/dataset_cache.npz"
 OUTPUT_FILE = "submission.csv"
 
 SEED = 42
-VALID_FRACTION = 0.2
+K_FOLDS = 5
 NAN_THRESHOLD = 0.9  # drop columns with more than 90% missing values
 LAMBDA = 1e-4
-MAX_ITERS = 500
+MAX_ITERS = 500  # gradient descent (train)
+NEWTON_ITERS = 10  # Newton's method (train_newton), used for the final model
 
 # Survey design columns (dates, record ids, sampling weights): they describe the
 # interview, not the person. WEIGHT2/HEIGHT3 mix pounds and kilograms in one column
@@ -50,9 +57,7 @@ DROPPED_COLUMNS = [
 ]
 
 
-
 # Data loading
-
 
 
 def load_data():
@@ -79,9 +84,7 @@ def load_data():
     return x_train, x_test, y_train, test_ids, names
 
 
-
 # Feature processing
-
 
 
 def replace_special_codes(x):
@@ -163,9 +166,116 @@ def transform(x, params):
     return np.c_[np.ones(len(x)), x]
 
 
+# Non-linear features: squares of the non-binary features, and pairwise products of
+# classic cardiovascular risk factors (logistic regression alone is linear in x)
+RISK_FACTORS = [
+    "_AGE80",  # age
+    "SEX",
+    "_BMI5",  # body mass index
+    "GENHLTH",  # self-reported general health
+    "_RFHYPE5",  # high blood pressure
+    "_RFCHOL",  # high cholesterol
+    "DIABETE3",
+    "_SMOKER3",
+    "CVDSTRK3",  # ever had a stroke
+    "DIFFWALK",  # difficulty walking
+]
+# 10 more health and lifestyle factors: with all 20, cross-validated F1 goes from
+# 0.4312 to 0.4326 (190 products instead of 45)
+EXTRA_RISK_FACTORS = [
+    "CHCKIDNY",  # kidney disease
+    "CHCCOPD1",  # chronic obstructive pulmonary disease
+    "HAVARTH3",  # arthritis
+    "ADDEPEV2",  # depression
+    "_TOTINDA",  # no physical activity
+    "DRNKANY5",  # drinks alcohol
+    "INCOME2",
+    "EDUCA",
+    "PHYSHLTH",  # days of poor physical health
+    "QLACTLM2",  # activity limited by health problems
+]
+CLIP = 5  # standardized values are clipped to +-5 before squaring, against outliers
+
+
+def _expand(base_tx, params):
+    """Append the squared (and cubed) and interaction columns to the baseline features."""
+    columns = [base_tx]
+    clipped = np.clip(base_tx[:, params["non_binary"]], -CLIP, CLIP)
+    if params["squares"]:
+        columns.append(clipped**2)
+    if params["cubes"]:
+        columns.append(clipped**3)
+    if params["pairs"]:
+        columns.append(
+            np.stack([base_tx[:, i] * base_tx[:, j] for i, j in params["pairs"]], 1)
+        )
+    return np.concatenate(columns, axis=1)
+
+
+def fit_poly(
+    x,
+    names,
+    squares=True,
+    interactions=True,
+    factors=RISK_FACTORS,
+    age_with_all=False,
+    cubes=False,
+):
+    """Learn the baseline preprocessing, then the stats of the added columns.
+
+    Args:
+        x: shape=(N, D), raw features
+        names: list of the D column names
+        squares, interactions, cubes: which kinds of columns to add
+        factors: column names whose pairwise products are added
+        age_with_all: also add age x every other feature
+
+    Returns:
+        dict with the baseline parameters, the added columns and their mean/std
+    """
+    base = fit_preprocessing(x, names)
+    base_tx = transform(x, base)[:, 1:]  # standardized, without the bias
+    kept = list(np.array(names)[base["keep"]][base["nonconstant"]])
+    pairs = []
+    if interactions:
+        pairs = list(itertools.combinations([kept.index(n) for n in factors], 2))
+    if age_with_all:
+        age = kept.index("_AGE80")
+        done = {frozenset(p) for p in pairs}
+        pairs += [
+            (age, j)
+            for j in range(len(kept))
+            if j != age and frozenset((age, j)) not in done
+        ]
+    params = {
+        "base": base,
+        "squares": squares,
+        "cubes": cubes,
+        "non_binary": np.array([len(np.unique(c)) > 2 for c in base_tx.T]),
+        "pairs": pairs,
+    }
+    expanded = _expand(base_tx, params)
+    params["mean"], params["std"] = expanded.mean(axis=0), expanded.std(axis=0)
+    return params
+
+
+def transform_poly(x, params):
+    """Apply fit_poly: baseline features + added columns, standardized, with bias.
+
+    Returns float32 to halve the memory (~500 columns, the Mac has 8 GB of RAM).
+    """
+    expanded = _expand(transform(x, params["base"])[:, 1:], params)
+    nc = params["std"] > 0
+    expanded = (expanded[:, nc] - params["mean"][nc]) / params["std"][nc]
+    return np.c_[np.ones(len(x)), expanded].astype(np.float32)
+
+
+def fit_final(x, names):
+    """Features of the final model: squares + products of all 20 risk factors."""
+    return fit_poly(x, names, factors=RISK_FACTORS + EXTRA_RISK_FACTORS)
+
 
 # Training and evaluation
-
 
 
 def train(y01, tx):
@@ -176,14 +286,45 @@ def train(y01, tx):
 
     Args:
         y01: shape=(N, ), labels in {0, 1}
+        tx: shape=(N, D), float64 or float32
+
+    Returns:
+        w: shape=(D, ), same dtype as tx
+    """
+    # y and w use the dtype of tx, so float32 inputs are never copied to float64
+    y01 = y01.astype(tx.dtype)
+    gram = (tx.T @ tx / len(y01)).astype(np.float64)
+    lipschitz = 0.25 * np.linalg.eigvalsh(gram).max() + 2 * LAMBDA
+    w, loss = reg_logistic_regression(
+        y01, tx, LAMBDA, np.zeros(tx.shape[1], dtype=tx.dtype), MAX_ITERS, 1 / lipschitz
+    )
+    print(f"  training loss: {loss:.4f}")
+    return w
+
+
+def train_newton(y01, tx, lambda_=LAMBDA, balanced=False):
+    """Regularized logistic regression with Newton's method.
+
+    Same objective as train(). With the ~360 correlated features of fit_poly,
+    500 gradient steps do not reach the minimum, while 10 Newton steps do
+    (cross-validated F1 0.4295 -> 0.4312).
+
+    Args:
+        y01: shape=(N, ), labels in {0, 1}
         tx: shape=(N, D)
+        lambda_: regularization parameter
+        balanced: weight the samples so that each class counts for half of the loss
 
     Returns:
         w: shape=(D, )
     """
-    lipschitz = 0.25 * np.linalg.eigvalsh(tx.T @ tx / len(y01)).max() + 2 * LAMBDA
-    w, loss = reg_logistic_regression(
-        y01, tx, LAMBDA, np.zeros(tx.shape[1]), MAX_ITERS, 1 / lipschitz
+    tx = tx.astype(np.float64)  # the Newton step is solved in float64
+    weights = None
+    if balanced:
+        pos = np.mean(y01 == 1)
+        weights = np.where(y01 == 1, 0.5 / pos, 0.5 / (1 - pos))
+    w, loss = reg_logistic_regression_newton(
+        y01, tx, lambda_, np.zeros(tx.shape[1]), NEWTON_ITERS, weights=weights
     )
     print(f"  training loss: {loss:.4f}")
     return w
@@ -211,6 +352,55 @@ def best_threshold(y01, proba):
     return thresholds[i], scores[i]
 
 
+def kfold_indices(n, k, seed):
+    """Split the indices 0..n-1 into k random folds of (almost) equal size."""
+    idx = np.random.default_rng(seed).permutation(n)
+    return np.array_split(idx, k)
+
+
+def cross_validate(x, y01, names, fit_fn, transform_fn, folds, train_fn=train):
+    """Out-of-fold scores of one preprocessing variant.
+
+    Each fold is predicted by a model trained on the other folds. The threshold is
+    tuned once on all these out-of-fold predictions, then scored fold by fold.
+
+    Args:
+        x: shape=(N, D), raw features
+        y01: shape=(N, ), labels in {0, 1}
+        names: list of the D column names
+        fit_fn, transform_fn: preprocessing functions (e.g. fit_preprocessing, transform)
+        folds: list of index arrays, from kfold_indices
+        train_fn: train (gradient descent) or train_newton
+
+    Returns:
+        threshold: tuned on all out-of-fold predictions
+        f1s, accuracies: one value per fold, at that threshold
+    """
+    proba = np.empty(len(y01))
+    for k, valid in enumerate(folds):
+        tr = np.concatenate([f for i, f in enumerate(folds) if i != k])
+        params = fit_fn(x[tr], names)
+        w = train_fn(y01[tr], transform_fn(x[tr], params))
+        proba[valid] = sigmoid(transform_fn(x[valid], params) @ w)
+    return score_folds(y01, proba, folds)
+
+
+def score_folds(y01, proba, folds):
+    """Tune the threshold on all out-of-fold predictions, then score each fold.
+
+    Args:
+        y01: shape=(N, ), labels in {0, 1}
+        proba: shape=(N, ), out-of-fold predicted scores
+        folds: list of index arrays, from kfold_indices
+
+    Returns:
+        threshold, and the per-fold F1 scores and accuracies at that threshold
+    """
+    threshold, _ = best_threshold(y01, proba)
+    f1s = [f1_score(y01[v], (proba[v] >= threshold).astype(int)) for v in folds]
+    accuracies = [np.mean((proba[v] >= threshold) == y01[v]) for v in folds]
+    return threshold, np.array(f1s), np.array(accuracies)
+
 
 # Main
 
@@ -220,27 +410,24 @@ def main():
     x_train, x_test, y_train, test_ids, names = load_data()
     y01 = (y_train + 1) / 2  # {-1, 1} -> {0, 1} for logistic regression
 
-    # 1) Validation: choose the threshold and estimate the score on held-out data
-    print("Validation run...")
-    rng = np.random.default_rng(SEED)
-    idx = rng.permutation(len(y01))
-    n_valid = int(VALID_FRACTION * len(y01))
-    valid, tr = idx[:n_valid], idx[n_valid:]
-
-    params = fit_preprocessing(x_train[tr], names)
-    w = train(y01[tr], transform(x_train[tr], params))
-    proba = sigmoid(transform(x_train[valid], params) @ w)
-    threshold, f1 = best_threshold(y01[valid], proba)
-    accuracy = np.mean((proba >= threshold) == y01[valid])
-    print(f"  validation: F1 = {f1:.4f}, accuracy = {accuracy:.4f}")
+    # 1) Cross-validation: choose the threshold and estimate the score on held-out data
+    print(f"{K_FOLDS}-fold cross-validation...")
+    folds = kfold_indices(len(y01), K_FOLDS, SEED)
+    threshold, f1s, accs = cross_validate(
+        x_train, y01, names, fit_final, transform_poly, folds, train_newton
+    )
+    print(f"  F1 = {f1s.mean():.4f} +- {f1s.std():.4f}")
+    print(f"  accuracy = {accs.mean():.4f} +- {accs.std():.4f}")
     print(f"  threshold = {threshold:.2f}")
 
     # 2) Final model on all training data, same hyperparameters and threshold
     print("Final training on all data...")
-    params = fit_preprocessing(x_train, names)
-    print(f"  {params['nonconstant'].sum()} features kept out of {len(names)}")
-    w = train(y01, transform(x_train, params))
-    pred01 = sigmoid(transform(x_test, params) @ w) >= threshold
+    params = fit_final(x_train, names)
+    tx_train = transform_poly(x_train, params)
+    print(f"  {tx_train.shape[1] - 1} features (raw data: {len(names)} columns)")
+    w = train_newton(y01, tx_train)
+    del tx_train  # free memory before building the test features
+    pred01 = sigmoid(transform_poly(x_test, params) @ w) >= threshold
     y_pred = np.where(pred01, 1, -1)  # back to {-1, 1} for the submission
     print(f"  {np.mean(y_pred == 1):.1%} of the test set predicted sick")
 

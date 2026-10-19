@@ -1,8 +1,10 @@
 """Generate the AIcrowd submission for Project 1 (heart disease prediction).
 
-Pipeline: load data -> clean features -> standardize -> add squared and interaction
-features -> regularized logistic regression (Newton's method) -> pick the decision
-threshold by 5-fold cross-validation -> predict test set.
+Pipeline: load data -> clean features -> two models, averaged:
+  - regularized logistic regression (Newton's method) on standardized features with
+    squared and interaction terms
+  - gradient boosted trees (boosting.py) on the cleaned raw features
+-> pick the decision threshold by 5-fold cross-validation -> predict test set.
 
 Usage: python run.py  (expects the dataset in data/dataset/, writes submission.csv)
 """
@@ -12,6 +14,7 @@ import os
 
 import numpy as np
 
+from boosting import apply_bins, fit_bins, predict_boosting, train_boosting
 from helpers import create_csv_submission, load_csv_data
 from implementations import (
     reg_logistic_regression,
@@ -29,6 +32,11 @@ NAN_THRESHOLD = 0.9  # drop columns with more than 90% missing values
 LAMBDA = 1e-4
 MAX_ITERS = 500  # gradient descent (train)
 NEWTON_ITERS = 10  # Newton's method (train_newton), used for the final model
+
+# Gradient boosted trees, averaged 50/50 with the logistic regression: the trees
+# alone reach a cross-validated F1 of 0.4347, the average 0.4364 (logistic: 0.4326)
+BOOSTING_SETTINGS = dict(n_trees=250, learning_rate=0.1, max_depth=4)
+BOOSTING_WEIGHT = 0.5
 
 # Survey design columns (dates, record ids, sampling weights): they describe the
 # interview, not the person. WEIGHT2/HEIGHT3 mix pounds and kilograms in one column
@@ -55,6 +63,11 @@ DROPPED_COLUMNS = [
     "WEIGHT2",
     "HEIGHT3",
 ]
+# Target leakage: "outpatient rehabilitation after your heart attack" is only asked
+# to people who had a heart attack (100% of the respondents are positive). It would
+# give the label away, so it is never used, even by the models that keep sparse
+# columns.
+LEAKY_COLUMNS = ["HAREHAB1"]
 
 
 # Data loading
@@ -405,6 +418,57 @@ def score_folds(y01, proba, folds):
 # Main
 
 
+def fit_tree_features(x, names):
+    """Columns and quantile bins of the boosted trees, learned on training data.
+
+    Unlike the linear model, the trees keep the mostly empty columns: many are
+    questions of optional modules asked only to a sub-group (e.g. diabetics), so
+    whether they were answered is informative. Missing values get their own bin,
+    so no imputation is needed.
+    """
+    clean = replace_special_codes(x)
+    dropped = DROPPED_COLUMNS + LEAKY_COLUMNS
+    keep = np.array([name not in dropped for name in names])
+    keep &= ~np.all(np.isnan(clean), axis=0)
+    return {"keep": keep, "edges": fit_bins(clean[:, keep])}
+
+
+def transform_tree_features(x, params):
+    """Binned features of fit_tree_features, shape (D, N)."""
+    return apply_bins(replace_special_codes(x)[:, params["keep"]], params["edges"])
+
+
+def fit_model(x, y01, names):
+    """Train the final model: logistic regression (Newton) on the 505 features of
+    fit_final, and gradient boosted trees on the binned raw features.
+
+    Args:
+        x: shape=(N, D), raw features
+        y01: shape=(N, ), labels in {0, 1}
+        names: list of the D column names
+
+    Returns:
+        dict with everything predict_model needs
+    """
+    poly = fit_final(x, names)
+    w = train_newton(y01, transform_poly(x, poly))
+    trees = fit_tree_features(x, names)
+    booster = train_boosting(
+        y01, transform_tree_features(x, trees), seed=SEED, **BOOSTING_SETTINGS
+    )
+    return {"poly": poly, "w": w, "trees": trees, "booster": booster}
+
+
+def predict_model(model, x):
+    """Probability of class 1: average of the logistic regression and the trees."""
+    tx = transform_poly(x, model["poly"]).astype(np.float64)
+    p_logistic = sigmoid(tx @ model["w"])
+    p_trees = predict_boosting(
+        model["booster"], transform_tree_features(x, model["trees"])
+    )
+    return BOOSTING_WEIGHT * p_trees + (1 - BOOSTING_WEIGHT) * p_logistic
+
+
 def main():
     print("Loading data...")
     x_train, x_test, y_train, test_ids, names = load_data()
@@ -413,24 +477,28 @@ def main():
     # 1) Cross-validation: choose the threshold and estimate the score on held-out data
     print(f"{K_FOLDS}-fold cross-validation...")
     folds = kfold_indices(len(y01), K_FOLDS, SEED)
-    threshold, f1s, accs = cross_validate(
-        x_train, y01, names, fit_final, transform_poly, folds, train_newton
-    )
+    proba = np.empty(len(y01))
+    for k, valid in enumerate(folds):
+        print(f"  fold {k + 1}/{K_FOLDS}")
+        tr = np.concatenate([f for i, f in enumerate(folds) if i != k])
+        model = fit_model(x_train[tr], y01[tr], names)
+        proba[valid] = predict_model(model, x_train[valid])
+    threshold, f1s, accs = score_folds(y01, proba, folds)
     print(f"  F1 = {f1s.mean():.4f} +- {f1s.std():.4f}")
     print(f"  accuracy = {accs.mean():.4f} +- {accs.std():.4f}")
     print(f"  threshold = {threshold:.2f}")
 
     # 2) Final model on all training data, same hyperparameters and threshold
     print("Final training on all data...")
-    params = fit_final(x_train, names)
-    tx_train = transform_poly(x_train, params)
-    print(f"  {tx_train.shape[1] - 1} features (raw data: {len(names)} columns)")
-    w = train_newton(y01, tx_train)
-    del tx_train  # free memory before building the test features
-    pred01 = sigmoid(transform_poly(x_test, params) @ w) >= threshold
+    write_submission(x_train, y01, x_test, test_ids, names, threshold)
+
+
+def write_submission(x_train, y01, x_test, test_ids, names, threshold):
+    """Train on all the training data and write the predictions for the test set."""
+    model = fit_model(x_train, y01, names)
+    pred01 = predict_model(model, x_test) >= threshold
     y_pred = np.where(pred01, 1, -1)  # back to {-1, 1} for the submission
     print(f"  {np.mean(y_pred == 1):.1%} of the test set predicted sick")
-
     create_csv_submission(test_ids, y_pred, OUTPUT_FILE)
     print(f"Submission written to {OUTPUT_FILE}")
 

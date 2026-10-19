@@ -8,6 +8,8 @@ Experiments, all on the same 5 folds as run.py:
 - newton: richer interactions and cubes on top of the 10-factor model, trained with
   Newton's method
 - tuning: regularization strength and class weights of the final model (Newton)
+- ensemble: averages of the final logistic regression and small neural networks
+- boosting: gradient boosted trees, alone and averaged with the logistic regression
 - learning_curve: training/validation loss vs training set size (bias-variance),
   saved as a figure for the report
 
@@ -16,7 +18,7 @@ and accuracy are reported per fold as mean +- std. Since the folds are shared, e
 row is also compared to a reference fold by fold, which tells whether a difference
 is real or just noise.
 
-Usage: python cross_validation.py [models|features|newton|tuning [variant ...]|learning_curve]
+Usage: python cross_validation.py [models|features|newton|tuning [variant ...]|ensemble|boosting|learning_curve]
 (models takes ~10 minutes; one-hot alone ~25 minutes, the other variants ~10 each)
 """
 
@@ -26,7 +28,9 @@ from functools import partial
 
 import numpy as np
 
+import boosting as gb
 import implementations as imp
+import mlp
 import run
 
 # One-hot variant: columns with at most MAX_CATEGORIES distinct values are treated
@@ -261,6 +265,104 @@ def compare_training(x, y01, names, folds, selected):
     return {name: run.score_folds(y01, s, folds) for name, s in scores.items()}
 
 
+# Ensembles of the final logistic regression with small neural networks (mlp.py).
+# The MLP is trained on the 198 baseline features; the probabilities are averaged.
+MLP_SETTINGS = dict(n_hidden=128, epochs=6, learning_rate=1e-3, weight_decay=1e-4)
+MLP_SEEDS = [42, 43, 44, 45, 46]
+ENSEMBLE_WEIGHTS = [0.2, 0.3, 0.4]  # weight of the MLP in the average
+
+
+def compare_ensembles(x, y01, names, folds):
+    """Cross-validate logistic regression (run.py), MLPs and their averages.
+
+    Returns:
+        dict name -> (threshold, per-fold F1, per-fold accuracy)
+    """
+    oof = {name: np.empty(len(y01)) for name in ["logistic", "MLP", "5 MLPs"]}
+    for k, valid in enumerate(folds):
+        print(f"fold {k + 1}/{len(folds)}...")
+        tr = np.concatenate([f for i, f in enumerate(folds) if i != k])
+        params = run.fit_final(x[tr], names)
+        w = run.train_newton(y01[tr], run.transform_poly(x[tr], params))
+        tx_valid = run.transform_poly(x[valid], params).astype(np.float64)
+        oof["logistic"][valid] = imp.sigmoid(tx_valid @ w)
+
+        base = run.fit_preprocessing(x[tr], names)
+        x_tr = run.transform(x[tr], base)[:, 1:]  # the MLP has its own bias
+        x_valid = run.transform(x[valid], base)[:, 1:]
+        probas = [
+            mlp.mlp_predict_proba(
+                mlp.train_mlp(y01[tr], x_tr, seed=seed, **MLP_SETTINGS), x_valid
+            )
+            for seed in MLP_SEEDS
+        ]
+        oof["MLP"][valid] = probas[0]
+        oof["5 MLPs"][valid] = np.mean(probas, axis=0)
+
+    for name in ["MLP", "5 MLPs"]:
+        for a in ENSEMBLE_WEIGHTS:
+            oof[f"{a:.1f} {name}"] = a * oof[name] + (1 - a) * oof["logistic"]
+    return {name: run.score_folds(y01, p, folds) for name, p in oof.items()}
+
+
+# Gradient boosted trees (boosting.py) on the cleaned raw features, sparse columns
+# included (no imputation: missing values get their own bin), alone and averaged
+# with the logistic regression
+BOOSTING_SETTINGS = dict(learning_rate=0.1, max_depth=4)
+BOOSTING_TREES = [250, 300, 350, 400]  # evaluated along the way, in one training
+BOOSTING_WEIGHTS = [0.5, 0.6, 0.7, 0.8]  # weight of the boosting in the average
+
+
+def boosting_features(x_tr, x_valid, names):
+    """Binned features for the trees, as in run.py."""
+    params = run.fit_tree_features(x_tr, names)
+    return (
+        run.transform_tree_features(x_tr, params),
+        run.transform_tree_features(x_valid, params),
+    )
+
+
+def compare_boosting(x, y01, names, folds):
+    """Cross-validate the boosted trees, alone and averaged with run.py's model.
+
+    Returns:
+        dict name -> (threshold, per-fold F1, per-fold accuracy)
+    """
+    oof = {"logistic": np.empty(len(y01))}
+    oof.update({f"GB {n}": np.empty(len(y01)) for n in BOOSTING_TREES})
+    for k, valid in enumerate(folds):
+        print(f"fold {k + 1}/{len(folds)}...")
+        tr = np.concatenate([f for i, f in enumerate(folds) if i != k])
+        params = run.fit_final(x[tr], names)
+        w = run.train_newton(y01[tr], run.transform_poly(x[tr], params))
+        tx_valid = run.transform_poly(x[valid], params).astype(np.float64)
+        oof["logistic"][valid] = imp.sigmoid(tx_valid @ w)
+
+        xb_tr, xb_valid = boosting_features(x[tr], x[valid], names)
+        score = {"valid": None}
+
+        def staged(n, model):  # running score of the validation fold
+            s = model["lr"] * gb.predict_tree(model["trees"][-1], xb_valid)
+            score["valid"] = (
+                s + model["base"] if score["valid"] is None else score["valid"] + s
+            )
+            if n in BOOSTING_TREES:
+                oof[f"GB {n}"][valid] = imp.sigmoid(score["valid"])
+
+        gb.train_boosting(
+            y01[tr],
+            xb_tr,
+            n_trees=max(BOOSTING_TREES),
+            callback=staged,
+            **BOOSTING_SETTINGS,
+        )
+
+    for n in BOOSTING_TREES:
+        for a in BOOSTING_WEIGHTS:
+            oof[f"{a:.1f} GB {n}"] = a * oof[f"GB {n}"] + (1 - a) * oof["logistic"]
+    return {name: run.score_folds(y01, p, folds) for name, p in oof.items()}
+
+
 # Learning curve (lecture 4b): training and validation loss for growing training
 # sets. Close curves mean high bias (the model is too simple), a gap means high
 # variance (overfitting).
@@ -411,6 +513,10 @@ def main():
     if experiment in ("tuning", "all"):
         results = compare_training(x_train, y01, names, folds, selected)
         print_table(results, "lambda 1e-4")
+    if experiment in ("ensemble", "all"):
+        print_table(compare_ensembles(x_train, y01, names, folds), "logistic")
+    if experiment in ("boosting", "all"):
+        print_table(compare_boosting(x_train, y01, names, folds), "logistic")
     if experiment in ("learning_curve", "all"):
         rows = learning_curve(x_train, y01, names, folds)
         print(

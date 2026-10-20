@@ -143,6 +143,7 @@ def train_boosting(
     lambda_=1.0,
     min_child_weight=1.0,
     subsample=0.7,
+    colsample=1.0,
     seed=42,
     callback=None,
 ):
@@ -157,6 +158,8 @@ def train_boosting(
         lambda_: L2 penalty on the leaf values
         min_child_weight: minimum sum of Hessians in a child
         subsample: fraction of the samples used to grow each tree
+        colsample: fraction of the features each tree may split on (as in random
+            forests: more diverse trees)
         seed: seed of the subsampling (reproducibility)
         callback: optional function(n_trees_so_far, model), called after each tree
 
@@ -171,7 +174,17 @@ def train_boosting(
         p = sigmoid(score)
         g, h = p - y, p * (1 - p)
         idx = np.sort(rng.choice(len(y), int(subsample * len(y)), replace=False))
-        tree = build_tree(xb, g, h, idx, max_depth, lambda_, min_child_weight)
+        if colsample < 1:
+            features = np.sort(
+                rng.choice(len(xb), int(colsample * len(xb)), replace=False)
+            )
+            tree = build_tree(
+                xb[features], g, h, idx, max_depth, lambda_, min_child_weight
+            )
+            internal = tree["feature"] >= 0
+            tree["feature"][internal] = features[tree["feature"][internal]]
+        else:
+            tree = build_tree(xb, g, h, idx, max_depth, lambda_, min_child_weight)
         model["trees"].append(tree)
         score += learning_rate * predict_tree(tree, xb)
         if callback is not None:

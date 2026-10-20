@@ -10,6 +10,10 @@ Experiments, all on the same 5 folds as run.py:
 - tuning: regularization strength and class weights of the final model (Newton)
 - ensemble: averages of the final logistic regression and small neural networks
 - boosting: gradient boosted trees, alone and averaged with the logistic regression
+- indicators: sub-group module indicators for the logistic regression
+- boosting_variants: smaller step / column subsampling for the trees (run after
+  indicators, whose saved predictions it reuses)
+- counts: global health features (numbers of conditions and limitations)
 - learning_curve: training/validation loss vs training set size (bias-variance),
   saved as a figure for the report
 
@@ -18,7 +22,7 @@ and accuracy are reported per fold as mean +- std. Since the folds are shared, e
 row is also compared to a reference fold by fold, which tells whether a difference
 is real or just noise.
 
-Usage: python cross_validation.py [models|features|newton|tuning [variant ...]|ensemble|boosting|learning_curve]
+Usage: python cross_validation.py [models|features|newton|tuning [variant ...]|ensemble|boosting|indicators|boosting_variants|counts|learning_curve]
 (models takes ~10 minutes; one-hot alone ~25 minutes, the other variants ~10 each)
 """
 
@@ -363,6 +367,232 @@ def compare_boosting(x, y01, names, folds):
     return {name: run.score_folds(y01, p, folds) for name, p in oof.items()}
 
 
+# Sub-group module indicators for the logistic regression: whether a person
+# answered the questions of an optional module (asked e.g. only to diabetics). The
+# questions of a module share the same pattern, so one indicator per distinct
+# pattern is kept. These are the columns that made the boosted trees better.
+OOF_FILE = "data/oof_predictions.npz"
+
+
+def fit_indicators(x, names):
+    """run.fit_final, plus one "answered" indicator per distinct module pattern."""
+    params = run.fit_final(x, names)
+    base_keep = params["base"]["keep"]
+    dropped = run.DROPPED_COLUMNS + run.LEAKY_COLUMNS
+    candidates = [
+        j
+        for j, name in enumerate(names)
+        if not base_keep[j] and name not in dropped and not np.all(np.isnan(x[:, j]))
+    ]
+    seen, columns = set(), []
+    for j in candidates:
+        answered = ~np.isnan(x[:, j])
+        pattern = np.packbits(answered).tobytes()
+        if answered.mean() >= MIN_FREQUENCY and pattern not in seen:
+            seen.add(pattern)
+            columns.append(j)
+    answered = ~np.isnan(x[:, columns])
+    params["indicators"] = columns
+    params["ind_mean"], params["ind_std"] = answered.mean(axis=0), answered.std(axis=0)
+    return params
+
+
+def transform_indicators(x, params):
+    """run.transform_poly features followed by the standardized indicators."""
+    answered = ~np.isnan(x[:, params["indicators"]])
+    indicators = (answered - params["ind_mean"]) / params["ind_std"]
+    return np.c_[run.transform_poly(x, params), indicators.astype(np.float32)]
+
+
+def compare_indicators(x, y01, names, folds):
+    """Logistic regression with and without indicators, the boosted trees of
+    run.py, and their 50/50 averages. The out-of-fold predictions are saved to
+    OOF_FILE so that later ensemble experiments do not need to retrain."""
+    oof = {name: np.empty(len(y01)) for name in ["logistic", "logistic+ind", "GB"]}
+    for k, valid in enumerate(folds):
+        print(f"fold {k + 1}/{len(folds)}...")
+        tr = np.concatenate([f for i, f in enumerate(folds) if i != k])
+        for name, fit_fn, transform_fn in [
+            ("logistic", run.fit_final, run.transform_poly),
+            ("logistic+ind", fit_indicators, transform_indicators),
+        ]:
+            params = fit_fn(x[tr], names)
+            w = run.train_newton(y01[tr], transform_fn(x[tr], params))
+            tx_valid = transform_fn(x[valid], params).astype(np.float64)
+            oof[name][valid] = imp.sigmoid(tx_valid @ w)
+        if k == 0:
+            print(f"  {len(params['indicators'])} module indicators")
+        xb_tr, xb_valid = boosting_features(x[tr], x[valid], names)
+        booster = gb.train_boosting(
+            y01[tr],
+            xb_tr,
+            n_trees=run.BOOSTING_SETTINGS["n_trees"],
+            learning_rate=run.BOOSTING_SETTINGS["learning_rate"],
+            max_depth=run.BOOSTING_SETTINGS["max_depth"],
+        )
+        oof["GB"][valid] = gb.predict_boosting(booster, xb_valid)
+    np.savez(OOF_FILE, **{k.replace("+", "_"): v for k, v in oof.items()})
+    oof["0.5 GB + log."] = 0.5 * oof["GB"] + 0.5 * oof["logistic"]
+    oof["0.5 GB + log+ind"] = 0.5 * oof["GB"] + 0.5 * oof["logistic+ind"]
+    return {name: run.score_folds(y01, p, folds) for name, p in oof.items()}
+
+
+# Boosting variants, averaged with the logistic regression whose out-of-fold
+# predictions were saved by the indicators experiment (same folds), so that only
+# the trees are retrained
+BOOSTING_VARIANTS = {
+    "lr 0.05": (dict(learning_rate=0.05, max_depth=4), [400, 500]),
+    "col 0.5": (dict(learning_rate=0.1, max_depth=4, colsample=0.5), [300, 350]),
+}
+VARIANT_WEIGHTS = [0.5, 0.6, 0.7]
+
+
+def compare_boosting_variants(x, y01, names, folds):
+    """Boosting variants alone and averaged with the saved logistic predictions."""
+    saved = dict(np.load(OOF_FILE))
+    oof = {"logistic": saved["logistic"], "current": None}
+    oof["current"] = 0.5 * saved["GB"] + 0.5 * saved["logistic"]  # run.py's model
+    for name, (_, trees) in BOOSTING_VARIANTS.items():
+        oof.update({f"{name} {n}": np.empty(len(y01)) for n in trees})
+    for k, valid in enumerate(folds):
+        print(f"fold {k + 1}/{len(folds)}...")
+        tr = np.concatenate([f for i, f in enumerate(folds) if i != k])
+        xb_tr, xb_valid = boosting_features(x[tr], x[valid], names)
+        for name, (settings, trees) in BOOSTING_VARIANTS.items():
+            score = {"valid": None}
+
+            def staged(n, model, name=name, trees=trees, score=score, valid=valid):
+                s = model["lr"] * gb.predict_tree(model["trees"][-1], xb_valid)
+                score["valid"] = (
+                    s + model["base"] if score["valid"] is None else score["valid"] + s
+                )
+                if n in trees:
+                    oof[f"{name} {n}"][valid] = imp.sigmoid(score["valid"])
+
+            gb.train_boosting(
+                y01[tr], xb_tr, n_trees=max(trees), callback=staged, **settings
+            )
+    for name, (_, trees) in BOOSTING_VARIANTS.items():
+        for n in trees:
+            for a in VARIANT_WEIGHTS:
+                oof[f"{a:.1f} {name} {n}"] = (
+                    a * oof[f"{name} {n}"] + (1 - a) * oof["logistic"]
+                )
+    np.savez(
+        OOF_FILE,
+        **saved,
+        **{
+            k.replace(" ", "_").replace(".", "p"): v
+            for k, v in oof.items()
+            if k.startswith(("lr", "col"))
+        },
+    )
+    return {name: run.score_folds(y01, p, folds) for name, p in oof.items()}
+
+
+# Global health features: models do not easily "count" over many columns (a tree
+# of depth 4 sees at most 4 of them), so we give them the totals directly.
+CONDITIONS = [  # "ever told you had ...": 1 = yes in BRFSS
+    "CVDSTRK3",
+    "ASTHMA3",
+    "CHCSCNCR",
+    "CHCOCNCR",
+    "CHCCOPD1",
+    "HAVARTH3",
+    "ADDEPEV2",
+    "CHCKIDNY",
+    "DIABETE3",
+    "BPHIGH4",
+    "TOLDHI2",
+]
+LIMITATIONS = [  # 1 = yes
+    "QLACTLM2",
+    "USEEQUIP",
+    "BLIND",
+    "DECIDE",
+    "DIFFWALK",
+    "DIFFDRES",
+    "DIFFALON",
+]
+
+
+def health_counts(x, names):
+    """Number of chronic conditions, number of limitations, and days of poor
+    physical + mental health in the last month (capped at 30).
+
+    Returns:
+        shape=(N, 3)
+    """
+    col = {name: j for j, name in enumerate(names)}
+    clean = run.replace_special_codes(x)
+    n_conditions = sum(clean[:, col[c]] == 1 for c in CONDITIONS)
+    n_limitations = sum(clean[:, col[c]] == 1 for c in LIMITATIONS)
+    days = np.nan_to_num(clean[:, col["PHYSHLTH"]]) + np.nan_to_num(
+        clean[:, col["MENTHLTH"]]
+    )
+    return np.c_[n_conditions, n_limitations, np.minimum(days, 30)].astype(float)
+
+
+def fit_counts(x, names):
+    """run.fit_final, plus the mean/std of the health counts."""
+    params = run.fit_final(x, names)
+    counts = health_counts(x, names)
+    params["count_mean"], params["count_std"] = counts.mean(axis=0), counts.std(axis=0)
+    params["names"] = names
+    return params
+
+
+def transform_counts(x, params):
+    """run.transform_poly features followed by the standardized health counts."""
+    counts = (health_counts(x, params["names"]) - params["count_mean"]) / params[
+        "count_std"
+    ]
+    return np.c_[run.transform_poly(x, params), counts.astype(np.float32)]
+
+
+def compare_counts(x, y01, names, folds):
+    """Health counts added to the logistic regression and to the trees, compared
+    with run.py's model (saved out-of-fold predictions, same folds)."""
+    saved = dict(np.load(OOF_FILE))
+    oof = {"current": 0.5 * saved["GB"] + 0.5 * saved["logistic"]}
+    oof.update({k: np.empty(len(y01)) for k in ["logistic+counts", "GB+counts"]})
+    for k, valid in enumerate(folds):
+        print(f"fold {k + 1}/{len(folds)}...")
+        tr = np.concatenate([f for i, f in enumerate(folds) if i != k])
+        params = fit_counts(x[tr], names)
+        w = run.train_newton(y01[tr], transform_counts(x[tr], params))
+        tx_valid = transform_counts(x[valid], params).astype(np.float64)
+        oof["logistic+counts"][valid] = imp.sigmoid(tx_valid @ w)
+        trees = run.fit_tree_features(x[tr], names)
+        edges = gb.fit_bins(health_counts(x[tr], names))
+        xb_tr = np.r_[
+            run.transform_tree_features(x[tr], trees),
+            gb.apply_bins(health_counts(x[tr], names), edges),
+        ]
+        xb_valid = np.r_[
+            run.transform_tree_features(x[valid], trees),
+            gb.apply_bins(health_counts(x[valid], names), edges),
+        ]
+        booster = gb.train_boosting(
+            y01[tr],
+            xb_tr,
+            n_trees=run.BOOSTING_SETTINGS["n_trees"],
+            learning_rate=run.BOOSTING_SETTINGS["learning_rate"],
+            max_depth=run.BOOSTING_SETTINGS["max_depth"],
+        )
+        oof["GB+counts"][valid] = gb.predict_boosting(booster, xb_valid)
+    np.savez(
+        OOF_FILE,
+        **saved,
+        logistic_counts=oof["logistic+counts"],
+        GB_counts=oof["GB+counts"],
+    )
+    oof["0.5 both+counts"] = 0.5 * oof["GB+counts"] + 0.5 * oof["logistic+counts"]
+    oof["0.5 GB+counts"] = 0.5 * oof["GB+counts"] + 0.5 * saved["logistic"]
+    oof["0.5 log+counts"] = 0.5 * saved["GB"] + 0.5 * oof["logistic+counts"]
+    return {name: run.score_folds(y01, p, folds) for name, p in oof.items()}
+
+
 # Learning curve (lecture 4b): training and validation loss for growing training
 # sets. Close curves mean high bias (the model is too simple), a gap means high
 # variance (overfitting).
@@ -517,6 +747,12 @@ def main():
         print_table(compare_ensembles(x_train, y01, names, folds), "logistic")
     if experiment in ("boosting", "all"):
         print_table(compare_boosting(x_train, y01, names, folds), "logistic")
+    if experiment in ("indicators", "all"):
+        print_table(compare_indicators(x_train, y01, names, folds), "logistic")
+    if experiment == "boosting_variants":  # needs the indicators experiment first
+        print_table(compare_boosting_variants(x_train, y01, names, folds), "current")
+    if experiment == "counts":  # needs the indicators experiment first
+        print_table(compare_counts(x_train, y01, names, folds), "current")
     if experiment in ("learning_curve", "all"):
         rows = learning_curve(x_train, y01, names, folds)
         print(

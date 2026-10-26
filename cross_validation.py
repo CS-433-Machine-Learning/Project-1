@@ -26,6 +26,7 @@ Usage: python cross_validation.py [models|features|newton|tuning [variant ...]|e
 (models takes ~10 minutes; one-hot alone ~25 minutes, the other variants ~10 each)
 """
 
+import os
 import sys
 import time
 from functools import partial
@@ -672,6 +673,7 @@ def plot_learning_curve(rows, path):
         fontsize=6.5, frameon=False, labelcolor=ink, loc="upper right", handlelength=3.5
     )
     fig.tight_layout()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     fig.savefig(path)
     print(f"figure saved to {path}")
 
